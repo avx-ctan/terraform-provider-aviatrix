@@ -7,136 +7,152 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// MockAsyncAPIClient interface for testing async API calls
+// MockAsyncAPIClient interface for testing async API calls with options
 type MockAsyncAPIClient interface {
-	PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc) error
+	PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc, opts ...AsyncOption) error
 }
 
-// TestableClient wraps Client to allow mocking PostAsyncAPI
-type TestableClient struct {
+// TestableClientHaGw wraps Client to allow mocking PostAsyncAPI
+type TestableClientHaGw struct {
 	*Client
 	MockAsyncAPI MockAsyncAPIClient
 }
 
 // Override PostAsyncAPI to use the mock
-func (tc *TestableClient) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc) error {
+func (tc *TestableClientHaGw) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc, opts ...AsyncOption) error {
 	if tc.MockAsyncAPI != nil {
-		return tc.MockAsyncAPI.PostAsyncAPI(action, i, checkFunc)
+		return tc.MockAsyncAPI.PostAsyncAPI(action, i, checkFunc, opts...)
 	}
-	return tc.Client.PostAsyncAPI(action, i, checkFunc)
+	return tc.Client.PostAsyncAPI(action, i, checkFunc, opts...)
 }
 
-// MockClient implements MockAsyncAPIClient
-type MockClient struct {
+// MockClientHaGw implements MockAsyncAPIClient
+type MockClientHaGw struct {
 	// Store the last call for verification
 	LastAction    string
 	LastInterface interface{}
 	LastCheckFunc CheckAPIResponseFunc
+	LastOpts      []AsyncOption
 	// Return values for the mock
 	ShouldReturnError error
+	// Simulated response data for the hook
+	SimulatedResponse map[string]interface{}
 	CallCount         int
 }
 
-func (m *MockClient) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc) error {
+func (m *MockClientHaGw) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc, opts ...AsyncOption) error {
 	m.CallCount++
 	m.LastAction = action
 	m.LastInterface = i
 	m.LastCheckFunc = checkFunc
+	m.LastOpts = opts
+
+	// If we have simulated response data, call the hooks
+	if m.SimulatedResponse != nil {
+		cfg := &asyncCfg{}
+		for _, o := range opts {
+			o(cfg)
+		}
+		if cfg.onResponse != nil {
+			cfg.onResponse(m.SimulatedResponse)
+		}
+	}
+
 	return m.ShouldReturnError
 }
 
-// TestCreateSpokeHaGw_ActualAsyncAPICall tests that the async API is actually called
-func TestCreateSpokeHaGw_ActualAsyncAPICall_Success(t *testing.T) {
-	// Create mock client
-	mockAPI := &MockClient{}
-	testClient := &TestableClient{
+// TestCreateSpokeHaGw_AsyncAPIReturnsHaGwName tests when async API returns the HA gateway name via hook
+func TestCreateSpokeHaGw_AsyncAPIReturnsHaGwName(t *testing.T) {
+	mockAPI := &MockClientHaGw{
+		SimulatedResponse: map[string]interface{}{
+			"ha_gw_name": "aws-vpc-1-gw-1-1", // Simulates controller returning actual name
+		},
+	}
+	testClient := &TestableClientHaGw{
 		Client:       &Client{CID: "test-cid"},
 		MockAsyncAPI: mockAPI,
 	}
 
-	// Create test gateway
 	gateway := &SpokeHaGateway{
-		PrimaryGwName: "primary-spoke-gw",
-		GwName:        "custom-ha-name",
+		PrimaryGwName: "aws-vpc-1-gw-1",
+		GwName:        "", // User didn't provide a name
 	}
 
-	// Call the actual function with mocked PostAsyncAPI
 	gwName, err := testClient.CreateSpokeHaGwWithMock(gateway)
 
-	// Verify the async API was called correctly
-	assert.NoError(t, err)
-	assert.Equal(t, 1, mockAPI.CallCount, "PostAsyncAPI should be called exactly once")
-	assert.Equal(t, "create_multicloud_ha_gateway", mockAPI.LastAction)
-
-	// Verify the gateway struct was set up correctly for the API call
-	calledGateway := mockAPI.LastInterface.(*SpokeHaGateway)
-	assert.Equal(t, "test-cid", calledGateway.CID)
-	assert.Equal(t, "create_multicloud_ha_gateway", calledGateway.Action)
-	assert.True(t, calledGateway.Async, "Async flag should be true when calling API")
-	assert.Equal(t, "primary-spoke-gw", calledGateway.PrimaryGwName)
-	assert.Equal(t, "custom-ha-name", calledGateway.GwName)
-
-	// Verify return value
-	assert.Equal(t, "custom-ha-name", gwName)
-}
-
-func TestCreateSpokeHaGw_ActualAsyncAPICall_Error(t *testing.T) {
-	// Create mock client that returns error
-	expectedError := errors.New("async API failed: timeout after 1 hour")
-	mockAPI := &MockClient{
-		ShouldReturnError: expectedError,
-	}
-	testClient := &TestableClient{
-		Client:       &Client{CID: "test-cid"},
-		MockAsyncAPI: mockAPI,
-	}
-
-	// Create test gateway
-	gateway := &SpokeHaGateway{
-		PrimaryGwName: "primary-spoke-gw",
-		GwName:        "custom-ha-name",
-	}
-
-	// Call the function - should return error
-	_, err := testClient.CreateSpokeHaGwWithMock(gateway)
-
-	// Verify error handling
-	assert.Error(t, err)
-	assert.Equal(t, expectedError, err)
-	assert.Equal(t, 1, mockAPI.CallCount, "PostAsyncAPI should still be called once")
-}
-
-func TestCreateSpokeHaGw_ActualAsyncAPICall_AutoGenName(t *testing.T) {
-	// Create mock client
-	mockAPI := &MockClient{}
-	testClient := &TestableClient{
-		Client:       &Client{CID: "test-cid"},
-		MockAsyncAPI: mockAPI,
-	}
-
-	// Create test gateway without GwName (should auto-generate)
-	gateway := &SpokeHaGateway{
-		PrimaryGwName: "primary-spoke-gw",
-		GwName:        "", // Empty - should trigger auto-generation
-	}
-
-	// Call the function
-	gwName, err := testClient.CreateSpokeHaGwWithMock(gateway)
-
-	// Verify the async API was called
 	assert.NoError(t, err)
 	assert.Equal(t, 1, mockAPI.CallCount)
-
-	// Verify the gateway passed to API has empty GwName (auto-gen is determined after API call)
-	calledGateway := mockAPI.LastInterface.(*SpokeHaGateway)
-	assert.Empty(t, calledGateway.GwName, "GwName should be empty when passed to API for auto-generation")
-
-	// Verify the returned name follows auto-generation pattern
-	assert.Equal(t, "primary-spoke-gw-hagw", gwName)
+	assert.Equal(t, "create_multicloud_ha_gateway", mockAPI.LastAction)
+	assert.Equal(t, "aws-vpc-1-gw-1-1", gwName, "Should use HA gateway name from async response hook")
 }
 
+// TestCreateSpokeHaGw_UserProvidedName tests when user provides a specific HA gateway name
+func TestCreateSpokeHaGw_UserProvidedName(t *testing.T) {
+	mockAPI := &MockClientHaGw{
+		SimulatedResponse: map[string]interface{}{}, // Async API doesn't return ha_gw_name
+	}
+	testClient := &TestableClientHaGw{
+		Client:       &Client{CID: "test-cid"},
+		MockAsyncAPI: mockAPI,
+	}
+
+	gateway := &SpokeHaGateway{
+		PrimaryGwName: "primary-spoke-gw",
+		GwName:        "my-custom-ha-gw", // User provided name
+	}
+
+	gwName, err := testClient.CreateSpokeHaGwWithMock(gateway)
+
+	assert.NoError(t, err)
+	assert.Equal(t, "my-custom-ha-gw", gwName, "Should use user-provided HA gateway name")
+}
+
+// TestCreateSpokeHaGw_AsyncAPIError tests error handling
+func TestCreateSpokeHaGw_AsyncAPIError(t *testing.T) {
+	expectedError := errors.New("async API failed: timeout after 1 hour")
+	mockAPI := &MockClientHaGw{
+		ShouldReturnError: expectedError,
+	}
+	testClient := &TestableClientHaGw{
+		Client:       &Client{CID: "test-cid"},
+		MockAsyncAPI: mockAPI,
+	}
+
+	gateway := &SpokeHaGateway{
+		PrimaryGwName: "primary-spoke-gw",
+		GwName:        "custom-ha-name",
+	}
+
+	_, err := testClient.CreateSpokeHaGwWithMock(gateway)
+
+	assert.Error(t, err)
+	assert.Equal(t, expectedError, err)
+	assert.Equal(t, 1, mockAPI.CallCount)
+}
+
+// TestCreateSpokeHaGw_NoNameReturned tests error when no HA gateway name is available
+func TestCreateSpokeHaGw_NoNameReturned(t *testing.T) {
+	mockAPI := &MockClientHaGw{
+		SimulatedResponse: map[string]interface{}{}, // Async API doesn't return ha_gw_name
+	}
+	testClient := &TestableClientHaGw{
+		Client:       &Client{CID: "test-cid"},
+		MockAsyncAPI: mockAPI,
+	}
+
+	gateway := &SpokeHaGateway{
+		PrimaryGwName: "primary-spoke-gw",
+		GwName:        "", // User didn't provide name either
+	}
+
+	_, err := testClient.CreateSpokeHaGwWithMock(gateway)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "HA gateway name not found")
+}
+
+// TestCreateSpokeHaGw_AsyncFlagAlwaysTrue tests that Async flag is always set to true
 func TestCreateSpokeHaGw_AsyncFlagAlwaysTrue(t *testing.T) {
-	// Test that Async flag is always set to true, regardless of input
 	testCases := []struct {
 		name         string
 		initialAsync bool
@@ -147,8 +163,12 @@ func TestCreateSpokeHaGw_AsyncFlagAlwaysTrue(t *testing.T) {
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			mockAPI := &MockClient{}
-			testClient := &TestableClient{
+			mockAPI := &MockClientHaGw{
+				SimulatedResponse: map[string]interface{}{
+					"ha_gw_name": "ha-gw-name",
+				},
+			}
+			testClient := &TestableClientHaGw{
 				Client:       &Client{CID: "test-cid"},
 				MockAsyncAPI: mockAPI,
 			}
@@ -156,59 +176,94 @@ func TestCreateSpokeHaGw_AsyncFlagAlwaysTrue(t *testing.T) {
 			gateway := &SpokeHaGateway{
 				PrimaryGwName: "primary-spoke-gw",
 				GwName:        "custom-ha-name",
-				Async:         tt.initialAsync, // Set initial value
+				Async:         tt.initialAsync,
 			}
 
-			// Call the function
 			_, err := testClient.CreateSpokeHaGwWithMock(gateway)
 			assert.NoError(t, err)
 
-			// Verify Async flag is always true when calling API
 			calledGateway := mockAPI.LastInterface.(*SpokeHaGateway)
-			assert.True(t, calledGateway.Async, "Async flag should always be true when calling API, regardless of initial value")
+			assert.True(t, calledGateway.Async, "Async flag should always be true when calling API")
 		})
 	}
 }
 
-func TestCreateSpokeHaGw_CheckFuncPassed(t *testing.T) {
-	// Test that the BasicCheck function is passed to PostAsyncAPI
-	mockAPI := &MockClient{}
-	testClient := &TestableClient{
+// TestCreateSpokeHaGw_PriorityOrder tests that async response takes priority over user-provided name
+func TestCreateSpokeHaGw_PriorityOrder(t *testing.T) {
+	mockAPI := &MockClientHaGw{
+		SimulatedResponse: map[string]interface{}{
+			"ha_gw_name": "async-returned-name", // Async API returns name
+		},
+	}
+	testClient := &TestableClientHaGw{
 		Client:       &Client{CID: "test-cid"},
 		MockAsyncAPI: mockAPI,
 	}
 
 	gateway := &SpokeHaGateway{
 		PrimaryGwName: "primary-spoke-gw",
-		GwName:        "custom-ha-name",
+		GwName:        "user-provided-name", // User also provided name
 	}
 
-	// Call the function
+	gwName, err := testClient.CreateSpokeHaGwWithMock(gateway)
+
+	assert.NoError(t, err)
+	// Async response should take priority
+	assert.Equal(t, "async-returned-name", gwName, "Async response should take priority over user-provided name")
+}
+
+// TestCreateSpokeHaGw_HookIsPassed tests that a hook is passed to PostAsyncAPI
+func TestCreateSpokeHaGw_HookIsPassed(t *testing.T) {
+	mockAPI := &MockClientHaGw{
+		SimulatedResponse: map[string]interface{}{
+			"ha_gw_name": "test-ha-gw",
+		},
+	}
+	testClient := &TestableClientHaGw{
+		Client:       &Client{CID: "test-cid"},
+		MockAsyncAPI: mockAPI,
+	}
+
+	gateway := &SpokeHaGateway{
+		PrimaryGwName: "primary-spoke-gw",
+	}
+
 	_, err := testClient.CreateSpokeHaGwWithMock(gateway)
 	assert.NoError(t, err)
 
-	// Verify that a check function was passed (we can't easily test the exact function)
-	assert.NotNil(t, mockAPI.LastCheckFunc, "CheckFunc should be passed to PostAsyncAPI")
+	// Verify that options (hook) were passed
+	assert.Len(t, mockAPI.LastOpts, 1, "Should pass one AsyncOption (the hook)")
 }
 
 // Helper method to simulate CreateSpokeHaGw with mocked PostAsyncAPI
-func (tc *TestableClient) CreateSpokeHaGwWithMock(spokeHaGateway *SpokeHaGateway) (string, error) {
+func (tc *TestableClientHaGw) CreateSpokeHaGwWithMock(spokeHaGateway *SpokeHaGateway) (string, error) {
 	// This replicates the exact logic from the real CreateSpokeHaGw function
 	spokeHaGateway.CID = tc.Client.CID
 	spokeHaGateway.Action = "create_multicloud_ha_gateway"
 	spokeHaGateway.Async = true // Enable async mode
 
-	// Use mocked PostAsyncAPI instead of real one
-	err := tc.PostAsyncAPI(spokeHaGateway.Action, spokeHaGateway, BasicCheck)
+	// Capture ha_gw_name from the async response using a hook
+	var haGwName string
+	hook := WithResponseHook(func(raw map[string]interface{}) {
+		if name, ok := raw["ha_gw_name"].(string); ok {
+			haGwName = name
+		}
+	})
+
+	err := tc.PostAsyncAPI(spokeHaGateway.Action, spokeHaGateway, BasicCheck, hook)
 	if err != nil {
 		return "", err
 	}
 
-	// Determine the gateway name for the return value
-	gwName := spokeHaGateway.GwName
-	if gwName == "" {
-		gwName = spokeHaGateway.PrimaryGwName + "-hagw"
+	// If async API returned the HA gateway name, use it
+	if haGwName != "" {
+		return haGwName, nil
 	}
 
-	return gwName, nil
+	// If user provided a specific HA gateway name, use it
+	if spokeHaGateway.GwName != "" {
+		return spokeHaGateway.GwName, nil
+	}
+
+	return "", errors.New("HA gateway name not found")
 }

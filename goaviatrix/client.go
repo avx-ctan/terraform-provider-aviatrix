@@ -328,45 +328,94 @@ func (c *Client) PostFileAPIContext(ctx context.Context, params map[string]strin
 	return checkAPIResp(resp, params["action"], checkFunc)
 }
 
-func (c *Client) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc) error {
-	return c.PostAsyncAPIContext(context.Background(), action, i, checkFunc)
+// ResponseHook is called with the raw response (both initial and poll responses),
+// allowing callers to extract custom fields like ha_gw_name.
+type ResponseHook func(raw map[string]interface{})
+
+// AsyncPollPayloadFunc returns the payload for polling task status.
+type AsyncPollPayloadFunc func(requestID string) interface{}
+
+// asyncCfg holds optional configuration for PostAsyncAPIContext.
+type asyncCfg struct {
+	onResponse  ResponseHook
+	pollPayload AsyncPollPayloadFunc
 }
 
-func (c *Client) PostAsyncAPIContext(ctx context.Context, action string, i interface{}, checkFunc CheckAPIResponseFunc) error {
+// AsyncOption configures async API behavior.
+type AsyncOption func(*asyncCfg)
+
+// WithResponseHook sets a hook to be called with the raw response.
+// The hook is called on both the initial response and each poll response,
+// allowing callers to extract custom fields like ha_gw_name whenever they appear.
+func WithResponseHook(h ResponseHook) AsyncOption {
+	return func(c *asyncCfg) { c.onResponse = h }
+}
+
+// WithPollPayload sets a custom function to generate the poll payload.
+func WithPollPayload(f AsyncPollPayloadFunc) AsyncOption {
+	return func(c *asyncCfg) { c.pollPayload = f }
+}
+
+// PostAsyncAPI submits an async request and waits for completion.
+func (c *Client) PostAsyncAPI(action string, i interface{}, checkFunc CheckAPIResponseFunc, opts ...AsyncOption) error {
+	return c.PostAsyncAPIContext(context.Background(), action, i, checkFunc, opts...)
+}
+
+//nolint:cyclop,funlen
+func (c *Client) PostAsyncAPIContext(ctx context.Context, action string, i interface{}, checkFunc CheckAPIResponseFunc, opts ...AsyncOption) error {
+	// Build config with defaults
+	cfg := asyncCfg{
+		pollPayload: func(requestID string) interface{} {
+			return map[string]string{
+				"action":     "check_task_status",
+				"CID":        c.CID,
+				"request_id": requestID,
+			}
+		},
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	log.Printf("[DEBUG] Post AsyncAPI %s: %v", action, i)
 	resp, err := c.PostContext(ctx, c.baseURL, i)
 	if err != nil {
-		return fmt.Errorf("HTTP POST %s failed: %v", action, err)
-	}
-	var data struct {
-		Return bool   `json:"return"`
-		Result string `json:"results"`
-		Reason string `json:"reason"`
+		return fmt.Errorf("HTTP POST %s failed: %w", action, err)
 	}
 
 	buf := new(bytes.Buffer)
 	buf.ReadFrom(resp.Body)
 	resp.Body.Close()
 	bodyString := buf.String()
-	bodyIoCopy := strings.NewReader(bodyString)
-	if err = json.NewDecoder(bodyIoCopy).Decode(&data); err != nil {
+
+	var data struct {
+		Return bool   `json:"return"`
+		Result string `json:"results"`
+		Reason string `json:"reason"`
+	}
+
+	if err = json.NewDecoder(strings.NewReader(bodyString)).Decode(&data); err != nil {
 		return fmt.Errorf("Json Decode %s failed %v\n Body: %s", action, err, bodyString)
 	}
 	if !data.Return {
 		return fmt.Errorf("rest API %s POST failed to initiate async action: %s", action, data.Reason)
 	}
 
-	requestID := data.Result
-	form := map[string]string{
-		"action":     "check_task_status",
-		"CID":        c.CID,
-		"request_id": requestID,
+	// Call the start response hook if provided
+	if cfg.onResponse != nil {
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(bodyString), &raw); err == nil {
+			cfg.onResponse(raw)
+		}
 	}
+
+	requestID := data.Result
 
 	const maxPoll = 360
 	sleepDuration := time.Second * 10
 	var j int
 	for ; j < maxPoll; j++ {
+		form := cfg.pollPayload(requestID)
 		resp, err = c.PostContext(ctx, c.baseURL, form)
 		if err != nil {
 			// Could be transient HTTP error, e.g. EOF error
@@ -375,7 +424,9 @@ func (c *Client) PostAsyncAPIContext(ctx context.Context, action string, i inter
 		}
 		buf = new(bytes.Buffer)
 		buf.ReadFrom(resp.Body)
-		err = json.Unmarshal(buf.Bytes(), &data)
+		resp.Body.Close()
+		pollBodyString := buf.String()
+		err = json.Unmarshal([]byte(pollBodyString), &data)
 		if err != nil {
 			// Only check for status codes after trying to parse JSON because we may get an error with a valid JSON body
 			// and that is a valid and actionable response...
@@ -383,8 +434,17 @@ func (c *Client) PostAsyncAPIContext(ctx context.Context, action string, i inter
 				time.Sleep(sleepDuration)
 				continue
 			}
-			return fmt.Errorf("decode check_task_status failed: %v\n Body: %s", err, buf.String())
+			return fmt.Errorf("decode check_task_status failed: %w\n Body: %s", err, pollBodyString)
 		}
+
+		// Call the hook on each poll response to capture fields like ha_gw_name
+		if cfg.onResponse != nil {
+			var raw map[string]interface{}
+			if err := json.Unmarshal([]byte(pollBodyString), &raw); err == nil {
+				cfg.onResponse(raw)
+			}
+		}
+
 		if !data.Return {
 			if data.Reason != "" && data.Reason != "REQUEST_IN_PROGRESS" {
 				return fmt.Errorf("rest API %s POST failed: %s", action, data.Reason)
